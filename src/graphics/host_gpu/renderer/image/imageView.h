@@ -18,8 +18,13 @@ namespace ImageViewOps {
 		case vk::Format::eD32Sfloat:
 		case vk::Format::eR32Sfloat:
 		case vk::Format::eR32Uint:
+		case vk::Format::eR32Sint:
 		case vk::Format::eD16Unorm:
-		case vk::Format::eR16Unorm: return true;
+		case vk::Format::eR16Unorm:
+		case vk::Format::eR16Snorm:
+		case vk::Format::eR16Sfloat:
+		case vk::Format::eR16Uint:
+		case vk::Format::eR16Sint: return true;
 		default: return false;
 	}
 }
