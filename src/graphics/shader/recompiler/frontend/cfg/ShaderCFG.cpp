@@ -514,16 +514,67 @@ bool ResolveSetpcTarget(const Decoder::Program& program, uint32_t setpc_index, u
 
 	const auto& setpc = program.instructions[setpc_index];
 	uint32_t    pc_reg = 0;
-	if (setpc.opcode != Opcode::S_SETPC_B64 || !ScalarOperandCode(setpc.src0, pc_reg)) {
+	if ((setpc.opcode != Opcode::S_SETPC_B64 && setpc.opcode != Opcode::S_SWAPPC_B64) ||
+	    !ScalarOperandCode(setpc.src0, pc_reg)) {
 		return false;
 	}
 
-	// A plain S_SETPC_B64 immediately following S_GETPC_B64.
-	if (setpc_index >= 1u) {
-		const auto& getpc = program.instructions[setpc_index - 1u];
-		if (getpc.opcode == Opcode::S_GETPC_B64 && IsScalarCode(getpc.dst, pc_reg)) {
-			target = InstructionEndPc(getpc);
-			return true;
+	// A 64-bit PC-relative S_SETPC_B64: S_GETPC, then ADD/SUB of an immediate
+	// followed by the matching ADDC/SUBB. (Resolved first, like AnyPS5.)
+	if (setpc_index >= 3u && (pc_reg % 2u) == 0u) {
+		const auto& high  = program.instructions[setpc_index - 1u];
+		const auto& low   = program.instructions[setpc_index - 2u];
+		const auto& getpc = program.instructions[setpc_index - 3u];
+		if (getpc.opcode == Opcode::S_GETPC_B64 && IsScalarCode(getpc.dst, pc_reg) &&
+		    IsScalarCode(low.dst, pc_reg) && IsScalarCode(high.dst, pc_reg + 1u)) {
+			const bool adds = low.opcode == Opcode::S_ADD_U32 && high.opcode == Opcode::S_ADDC_U32;
+			const bool subs = low.opcode == Opcode::S_SUB_U32 && high.opcode == Opcode::S_SUBB_U32;
+			if (adds || subs) {
+				uint32_t low_imm = 0;
+				bool      low_imm_is_src0 = false;
+				bool      low_has_imm = false;
+				if (IsImmediate(low.src0, low_imm)) {
+					low_has_imm = true;
+					low_imm_is_src0 = true;
+				} else if (IsImmediate(low.src1, low_imm)) {
+					low_has_imm = true;
+					low_imm_is_src0 = false;
+				}
+				const bool low_reg_first  = IsScalarCode(low.src0, pc_reg);
+				const bool low_reg_second = IsScalarCode(low.src1, pc_reg);
+				const bool low_adds_ok = low_has_imm &&
+					((low_reg_first && !low_imm_is_src0) || (low_reg_second && low_imm_is_src0));
+				const bool low_subs_ok = low_has_imm && low_reg_first && !low_imm_is_src0;
+
+				uint32_t high_imm = 0;
+				bool      high_imm_is_src0 = false;
+				bool      high_has_imm = false;
+				if (IsImmediate(high.src0, high_imm)) {
+					high_has_imm = true;
+					high_imm_is_src0 = true;
+				} else if (IsImmediate(high.src1, high_imm)) {
+					high_has_imm = true;
+					high_imm_is_src0 = false;
+				}
+				const bool high_reg_first  = IsScalarCode(high.src0, pc_reg + 1u);
+				const bool high_reg_second = IsScalarCode(high.src1, pc_reg + 1u);
+				const bool high_adds_ok = high_has_imm &&
+					((high_reg_first && !high_imm_is_src0) || (high_reg_second && high_imm_is_src0));
+				const bool high_subs_ok = high_has_imm && high_reg_first && !high_imm_is_src0;
+
+				const bool low_ok  = adds ? low_adds_ok  : low_subs_ok;
+				const bool high_ok = adds ? high_adds_ok : high_subs_ok;
+
+				if (low_ok && high_ok) {
+					const auto offset = (static_cast<uint64_t>(high_imm) << 32u) | low_imm;
+					const auto base = static_cast<uint64_t>(InstructionEndPc(getpc));
+					const auto destination = adds ? base + offset : base - offset;
+					if (destination <= UINT32_MAX && (destination & 3u) == 0u) {
+						target = static_cast<uint32_t>(destination);
+						return true;
+					}
+				}
+			}
 		}
 	}
 
@@ -533,15 +584,24 @@ bool ResolveSetpcTarget(const Decoder::Program& program, uint32_t setpc_index, u
 		const auto& getpc = program.instructions[setpc_index - 2u];
 		if (getpc.opcode == Opcode::S_GETPC_B64 && IsScalarCode(getpc.dst, pc_reg) &&
 		    IsScalarCode(arith.dst, pc_reg)) {
+			const bool reg_first  = IsScalarCode(arith.src0, pc_reg);
+			const bool reg_second = IsScalarCode(arith.src1, pc_reg);
+			uint32_t imm = 0;
+			bool      imm_is_src0 = false;
+			bool      has_imm = false;
+			if (IsImmediate(arith.src0, imm)) {
+				has_imm = true;
+				imm_is_src0 = true;
+			} else if (IsImmediate(arith.src1, imm)) {
+				has_imm = true;
+				imm_is_src0 = false;
+			}
 			const bool adds = arith.opcode == Opcode::S_ADD_U32 || arith.opcode == Opcode::S_ADD_I32;
-			const bool subs = arith.opcode == Opcode::S_SUB_U32 || arith.opcode == Opcode::S_SUB_I32;
-			if (adds || subs) {
-				uint32_t imm = 0;
-				const bool reg_first  = IsScalarCode(arith.src0, pc_reg);
-				const bool reg_second = IsScalarCode(arith.src1, pc_reg);
-				const bool imm_first  = IsImmediate(arith.src0, imm);
-				const bool imm_second = IsImmediate(arith.src1, imm);
-				if ((reg_first && imm_second) || (reg_second && imm_first)) {
+			const bool subs = (arith.opcode == Opcode::S_SUB_U32 || arith.opcode == Opcode::S_SUB_I32) && reg_first;
+			if (has_imm && (adds || subs)) {
+				const bool ok = adds ? ((reg_first && !imm_is_src0) || (reg_second && imm_is_src0))
+				                     : (reg_first && !imm_is_src0);
+				if (ok) {
 					const auto base = InstructionEndPc(getpc);
 					target          = (adds ? base + imm : base - imm) & ~3u;
 					return true;
@@ -550,49 +610,12 @@ bool ResolveSetpcTarget(const Decoder::Program& program, uint32_t setpc_index, u
 		}
 	}
 
-	// A 64-bit PC-relative S_SETPC_B64: S_GETPC, then ADD/SUB of an immediate
-	// followed by the matching ADDC/SUBB of zero.
-	if (setpc_index >= 3u) {
-		const auto& high = program.instructions[setpc_index - 1u];
-		const auto& low  = program.instructions[setpc_index - 2u];
-		const auto& getpc = program.instructions[setpc_index - 3u];
-		if (getpc.opcode == Opcode::S_GETPC_B64 && IsScalarCode(getpc.dst, pc_reg) &&
-		    IsScalarCode(low.dst, pc_reg) && IsScalarCode(high.dst, pc_reg + 1u)) {
-			const bool adds = low.opcode == Opcode::S_ADD_U32 || low.opcode == Opcode::S_ADD_I32;
-			const bool subs = low.opcode == Opcode::S_SUB_U32 || low.opcode == Opcode::S_SUB_I32;
-			if (adds || subs) {
-				uint32_t imm = 0;
-				const bool low_reg_first  = IsScalarCode(low.src0, pc_reg);
-				const bool low_reg_second = IsScalarCode(low.src1, pc_reg);
-				const bool low_imm_first  = IsImmediate(low.src0, imm);
-				const bool low_imm_second = IsImmediate(low.src1, imm);
-				if (!((low_reg_first && low_imm_second) || (low_reg_second && low_imm_first))) {
-					return false;
-				}
-
-				const bool high_ok = [&]() {
-					uint32_t zero = 0;
-					if (adds) {
-						if (high.opcode != Opcode::S_ADDC_U32) return false;
-						if (IsScalarCode(high.src0, pc_reg + 1u) &&
-						    IsImmediate(high.src1, zero) && zero == 0u) return true;
-						if (IsScalarCode(high.src1, pc_reg + 1u) &&
-						    IsImmediate(high.src0, zero) && zero == 0u) return true;
-						return false;
-					}
-					if (high.opcode != Opcode::S_SUBB_U32) return false;
-					if (IsScalarCode(high.src0, pc_reg + 1u) &&
-					    IsImmediate(high.src1, zero) && zero == 0u) return true;
-					if (IsScalarCode(high.src1, pc_reg + 1u) &&
-					    IsImmediate(high.src0, zero) && zero == 0u) return true;
-					return false;
-				}();
-				if (high_ok) {
-					const auto base = InstructionEndPc(getpc);
-					target          = (adds ? base + imm : base - imm) & ~3u;
-					return true;
-				}
-			}
+	// A plain S_SETPC_B64 immediately following S_GETPC_B64.
+	if (setpc_index >= 1u) {
+		const auto& getpc = program.instructions[setpc_index - 1u];
+		if (getpc.opcode == Opcode::S_GETPC_B64 && IsScalarCode(getpc.dst, pc_reg)) {
+			target = InstructionEndPc(getpc);
+			return true;
 		}
 	}
 
